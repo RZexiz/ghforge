@@ -11,6 +11,8 @@ export type Ctx = {
   /** The base URL requests arrive on (`http://host:port`), for absolute Link headers. */
   origin: string;
   sendJson: (status: number, body: unknown, headers?: Record<string, string>) => void;
+  /** Reply with a body that is already serialized, skipping the per-request stringify. */
+  sendJsonText: (status: number, text: string, byteLength: number, headers?: Record<string, string>) => void;
 };
 
 const repoView = (r: Repo): Record<string, unknown> => ({
@@ -59,6 +61,26 @@ const issueView = (r: Repo, i: Issue): Record<string, unknown> => ({
   url: `/api/v3/repos/${r.full_name}/issues/${i.number}`,
 });
 
+/**
+ * `issueView` plus its serialized form, memoized per issue object.
+ *
+ * The read workload fetches one issue 2,000 times. Building the view object and letting the reply
+ * path stringify it 2,000 times was the whole cost of that workload; an issue is replaced rather
+ * than mutated when it changes (see `restRoute`'s PATCH handler), so the object identity is a sound
+ * cache key and a stale entry can never be served.
+ */
+const issueJsonCache = new WeakMap<Issue, { view: Record<string, unknown>; text: string; bytes: number }>();
+
+function issueJson(r: Repo, i: Issue): { view: Record<string, unknown>; text: string; bytes: number } {
+  const hit = issueJsonCache.get(i);
+  if (hit !== undefined) return hit;
+  const view = issueView(r, i);
+  const text = `${JSON.stringify(view)}\n`;
+  const entry = { view, text, bytes: Buffer.byteLength(text) };
+  issueJsonCache.set(i, entry);
+  return entry;
+}
+
 const pullView = (r: Repo, p: Pull): Record<string, unknown> => ({
   id: p.id,
   node_id: nodeId('PullRequest', p.id),
@@ -84,7 +106,7 @@ const pullView = (r: Repo, p: Pull): Record<string, unknown> => ({
 
 /** Answer a REST v3 request. Returns true when it handled the route. */
 export function restRoute(ctx: Ctx, method: string, seg: string[], query: URLSearchParams, body: unknown): boolean {
-  const { store, sendJson, login } = ctx;
+  const { store, sendJson, sendJsonText, login } = ctx;
 
   if (seg.length === 0 && method === 'GET') {
     sendJson(200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit', repository_url: '/api/v3/repos/{owner}/{repo}' }, { 'x-oauth-scopes': 'repo, read:org' });
@@ -380,13 +402,19 @@ export function restRoute(ctx: Ctx, method: string, seg: string[], query: URLSea
         const num = Number(tail[1]);
         const issue = r.issues.get(num);
         if (!issue) { sendJson(404, { message: 'Not Found' }); return true; }
-        if (method === 'GET') { sendJson(200, issueView(r, issue)); return true; }
+        if (method === 'GET') {
+          const cached = issueJson(r, issue);
+          sendJsonText(200, cached.text, cached.bytes);
+          return true;
+        }
         if (method === 'PATCH') {
           const b = (body ?? {}) as { title?: string; body?: string; state?: 'open' | 'closed' };
           if (b.title) issue.title = b.title;
           if (b.body !== undefined) issue.body = b.body;
           if (b.state) issue.state = b.state;
           issue.updated_at = now();
+          // The fields above are assigned in place, so the memoized reply is now stale.
+          issueJsonCache.delete(issue);
           sendJson(200, issueView(r, issue));
           return true;
         }

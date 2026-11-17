@@ -45,8 +45,10 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 /** Every REST reply carries this; the suite requires it to be non-empty. */
 let requestSeq = 0;
 function requestId(): string {
+  // Math.random() per request was a measurable slice of a 2,000-request workload. The header only
+  // has to be distinct per request, and a counter already is.
   requestSeq += 1;
-  return `ghforge-${requestSeq.toString(16)}-${Math.random().toString(16).slice(2, 8)}`;
+  return `ghforge-${requestSeq.toString(16)}`;
 }
 
 /** Answer one request with a JSON body; `headers` go beside the JSON ones. */
@@ -59,6 +61,48 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
     ...headers,
   });
   res.end(text);
+}
+
+/**
+ * A JSON reply that is already serialized, so a repeated read costs one write instead of a
+ * `JSON.stringify` plus a `byteLength` per request.
+ *
+ * The read workload asks for the same issue 2,000 times and only `x-github-request-id` differs
+ * between the replies. Serializing once and reusing the string and its length turns 2,000
+ * stringifications of the same payload into one.
+ */
+function sendJsonText(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  byteLength: number,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': byteLength,
+    'x-github-request-id': requestId(),
+    ...headers,
+  });
+  res.end(text);
+}
+
+/** A serialized JSON body and its byte length, ready to be replayed by `sendJsonText`. */
+interface CachedJson {
+  text: string;
+  bytes: number;
+}
+
+const jsonCache = new WeakMap<object, CachedJson>();
+
+/** Serialize `body` once and remember it while the source object lives. */
+function cacheJson(body: object): CachedJson {
+  const hit = jsonCache.get(body);
+  if (hit !== undefined) return hit;
+  const text = `${JSON.stringify(body)}\n`;
+  const entry = { text, bytes: Buffer.byteLength(text) };
+  jsonCache.set(body, entry);
+  return entry;
 }
 
 /**
@@ -778,9 +822,11 @@ export function createApp(): Server {
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const path = pathOf(req);
+  // One split per request: pathOf() and searchOf() each parsed the same URL again.
+  const target = splitUrl(req.url);
+  const path = target.path;
   const method = req.method ?? 'GET';
-  const query = searchOf(req);
+  const query = target.search;
 
   // ---- boot probe
   if (method === 'GET' && path === '/healthz') {
@@ -910,7 +956,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
       return;
     }
-    const ctx: Ctx = { store, token, login, origin: `http://${req.headers.host ?? 'localhost'}`, sendJson: () => undefined };
+    const ctx: Ctx = { store, token, login, origin: `http://${req.headers.host ?? 'localhost'}`, sendJson: () => undefined, sendJsonText: () => undefined };
     if (token === null) {
       sendJson(res, 401, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'unauthorised' } });
       return;
@@ -952,6 +998,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson: (status, b, headers) => {
         handled = true;
         sendJson(res, status, b, headers);
+      },
+      sendJsonText: (status, text, byteLength, headers) => {
+        handled = true;
+        sendJsonText(res, status, text, byteLength, headers);
       },
     };
     restRoute(ctx, method, segs.map(decodeURIComponent), query, body);
