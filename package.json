@@ -1,0 +1,14 @@
+{
+  "name": "ghforge",
+  "version": "0.0.0",
+  "private": false,
+  "type": "module",
+  "description": "A standalone GitHub-compatible git forge: git smart HTTP, REST v3, GraphQL and MCP from one process and its own store",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
