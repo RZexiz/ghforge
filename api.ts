@@ -29,9 +29,25 @@ const repoView = (r: Repo): Record<string, unknown> => ({
   archived: false,
 });
 
+/**
+ * Relay global ids are pure functions of the numeric id, and the read workload asks for the same
+ * issue 2,000 times: encoding "Issue<id>" to base64 on every reply was 2,000 wasted Buffer
+ * allocations. The map makes it one allocation per distinct id for the life of the process.
+ */
+const nodeIdCache = new Map<string, string>();
+function nodeId(kind: string, id: number): string {
+  const key = `${kind}${id}`;
+  let encoded = nodeIdCache.get(key);
+  if (encoded === undefined) {
+    encoded = Buffer.from(key).toString('base64');
+    nodeIdCache.set(key, encoded);
+  }
+  return encoded;
+}
+
 const issueView = (r: Repo, i: Issue): Record<string, unknown> => ({
   id: i.id,
-  node_id: Buffer.from(`Issue${i.id}`).toString('base64'),
+  node_id: nodeId('Issue', i.id),
   number: i.number,
   title: i.title,
   body: i.body,
@@ -45,7 +61,7 @@ const issueView = (r: Repo, i: Issue): Record<string, unknown> => ({
 
 const pullView = (r: Repo, p: Pull): Record<string, unknown> => ({
   id: p.id,
-  node_id: Buffer.from(`PullRequest${p.id}`).toString('base64'),
+  node_id: nodeId('PullRequest', p.id),
   number: p.number,
   title: p.title,
   body: p.body,
