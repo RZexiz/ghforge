@@ -973,6 +973,9 @@ export function graphqlRoute(ctx: Ctx, body: unknown): void {
     const issue = hit.obj as Issue;
     issue.state = 'closed';
     issue.updated_at = now();
+    // The reply body is memoized per issue object, and this mutation is in place, so the entry has
+    // to go or a later REST GET would still report the issue as open.
+    issueJsonCache.delete(issue);
     sendJson(200, { data: { closeIssue: { issue: gqlIssue(hit.repo, issue) } } });
     return;
   }
