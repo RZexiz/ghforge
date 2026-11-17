@@ -353,6 +353,9 @@ export function restRoute(ctx: Ctx, method: string, seg: string[], query: URLSea
           }
         }
         r.seq.issue += 1;
+        // One clock read, not two: created_at and updated_at are the same instant here, and a
+        // fresh timestamp is a parsed ISO string plus a formatted one.
+        const stamp = now();
         const issue: Issue = {
           id: 9000 + r.seq.issue,
           number: r.seq.issue,
@@ -360,12 +363,14 @@ export function restRoute(ctx: Ctx, method: string, seg: string[], query: URLSea
           body: b.body ?? null,
           state: 'open',
           labels: (b.labels ?? []).map((n) => r.labels.get(n)!),
-          created_at: now(),
-          updated_at: now(),
+          created_at: stamp,
+          updated_at: stamp,
           user: { login },
         };
         r.issues.set(issue.number, issue);
-        sendJson(201, issueView(r, issue));
+        // Serializing through issueJson also primes the reply a follow-up GET of this issue reuses.
+        const cached = issueJson(r, issue);
+        sendJsonText(201, cached.text, cached.bytes);
         return true;
       }
       // /issues/{number}/comments
