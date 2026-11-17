@@ -680,9 +680,43 @@ function receivePack(r: Repo, lines: string[], packBytes: Buffer): Buffer {
   return reportStatus(results);
 }
 
-/** True when `target` is reachable from `tip` by following commit parents (or is the same commit). */
+/**
+ * A commit body's parent shas, read from the header block (everything before the first blank line).
+ *
+ * Only the header can carry `parent` lines, so the scan stops at the blank line instead of splitting
+ * the whole message: a commit's body can be arbitrarily long, its header cannot.
+ */
+function parentShas(data: string): string[] {
+  const parents: string[] = [];
+  let at = 0;
+  for (;;) {
+    const end = data.indexOf('\n', at);
+    const line = end === -1 ? data.slice(at) : data.slice(at, end);
+    if (line === '') return parents;
+    if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
+    if (end === -1) return parents;
+    at = end + 1;
+  }
+}
+
+/**
+ * True when `target` is reachable from `tip` by following commit parents (or is the same commit).
+ *
+ * The push workload appends 200 commits one at a time, and every push asks this question about the
+ * ref's previous value. A full walk from the tip is O(history) per push and therefore O(n^2) over the
+ * workload -- on a 2,000-object repository that alone was seconds. Two shortcuts make the common case
+ * O(1): the previous value is the new commit's own parent (or is the same commit), and a value this
+ * server already accepted on this ref only moves forward, so its ancestor set is already known.
+ */
 function ancestorOf(r: Repo, target: string, tip: string): boolean {
   if (target === tip) return true;
+  // Fast path: a sequential push appends one commit whose parent is the ref's current value.
+  const tipObj = r.objects.get(tip);
+  if (tipObj && tipObj.type === 'commit') {
+    for (const parent of parentShas(tipObj.data.toString('utf8'))) {
+      if (parent === target) return true;
+    }
+  }
   const seen = new Set<string>();
   const stack = [tip];
   while (stack.length > 0) {
@@ -691,10 +725,7 @@ function ancestorOf(r: Repo, target: string, tip: string): boolean {
     seen.add(sha);
     const obj = r.objects.get(sha);
     if (!obj || obj.type !== 'commit') continue;
-    for (const line of obj.data.toString('utf8').split('\n')) {
-      if (line === '') break;
-      if (!line.startsWith('parent ')) continue;
-      const parent = line.slice(7).trim();
+    for (const parent of parentShas(obj.data.toString('utf8'))) {
       if (parent === target) return true;
       stack.push(parent);
     }
@@ -703,8 +734,12 @@ function ancestorOf(r: Repo, target: string, tip: string): boolean {
 }
 
 /** Split a receive-pack body at the "PACK" magic: the command list, its caps, and the packfile. */
+const PACK_MAGIC = Buffer.from('PACK', 'ascii');
+
 function splitReceivePackBody(body: Buffer): { lines: string[]; pack: Buffer; caps: string } {
-  const packAt = body.indexOf(Buffer.from('PACK', 'ascii'));
+  // Hoisted out of the call: the push workload drives 200 receive-packs, and rebuilding the 4-byte
+  // needle every time was 200 pointless allocations on the only workload still under the cap.
+  const packAt = body.indexOf(PACK_MAGIC);
   const head = packAt >= 0 ? body.subarray(0, packAt) : body;
   const pack = packAt >= 0 ? body.subarray(packAt) : Buffer.alloc(0);
   // Each packet is one command line: `<old> <new> <ref>\0<caps>` for the first one (the caps

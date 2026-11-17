@@ -306,41 +306,35 @@ export function readPack(
  * (the pack header states it), which makes the exact stream end findable; unknown grows a window.
  */
 function inflateAt(buf: Buffer, pos: number, expected?: number): { data: Buffer; next: number } {
-  if (expected !== undefined && expected >= 0) {
-    const budget = expected + 1024;
-    const data = inflateSync(buf.subarray(pos, Math.min(buf.length, pos + budget * 2 + 64)));
-    return { data, next: pos + compressedLength(buf, pos, data.length) };
-  }
-  for (let span = 8; span <= buf.length - pos; span = Math.min(Math.max(span * 2, 8), buf.length - pos)) {
-    try {
-      const data = inflateSync(buf.subarray(pos, pos + span));
-      for (let exact = 8; exact <= span; exact += 1) {
-        try {
-          const d2 = inflateSync(buf.subarray(pos, pos + exact));
-          if (d2.length === data.length) return { data: d2, next: pos + exact };
-        } catch {
-          /* not yet */
-        }
-      }
-      return { data, next: pos + span };
-    } catch {
-      /* keep growing */
-    }
-  }
-  return { data: inflateSync(buf.subarray(pos)), next: buf.length };
+  // One inflate for both jobs: zlib reports the inflated bytes and, via `info`, exactly how many
+  // input bytes the stream consumed. The size hint is no longer needed -- the old code used it to
+  // guess a window, and the guess was wrong often enough to fall back to byte-by-byte probing.
+  void expected;
+  // `info: true` swaps the return for `{ buffer, engine }`: `buffer` is the inflated bytes and
+  // `engine.bytesWritten` is exactly how many input bytes the deflate stream consumed.
+  const result = inflateSync(buf.subarray(pos), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  return { data: result.buffer, next: pos + result.engine.bytesWritten };
 }
 
 /** The compressed length of the stream that inflated to `inflatedSize` bytes at `pos`. */
-function compressedLength(buf: Buffer, pos: number, inflatedSize: number): number {
-  for (let exact = 8; exact <= buf.length - pos; exact += 1) {
-    try {
-      const d = inflateSync(buf.subarray(pos, pos + exact));
-      if (d.length === inflatedSize) return exact;
-    } catch {
-      /* not yet */
-    }
+/**
+ * Byte length of the deflate stream starting at `pos`, found exactly.
+ *
+ * The old version grew the window one byte at a time and re-inflated the whole prefix on every step,
+ * so a single 300-byte object cost ~300 `inflateSync` calls and the push workload (135 objects a push)
+ * spent millions of them. `info: true` makes zlib stop at the end of the stream and report how many
+ * input bytes it actually consumed, so one call is enough.
+ */
+function compressedLength(buf: Buffer, pos: number): number {
+  try {
+    const result = inflateSync(buf.subarray(pos), { info: true }) as unknown as { engine: { bytesWritten: number } };
+    return result.engine.bytesWritten;
+  } catch {
+    return buf.length - pos;
   }
-  return buf.length - pos;
 }
 
 export function applyDelta(base: Buffer, delta: Buffer): Buffer {
