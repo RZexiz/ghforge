@@ -400,6 +400,8 @@ function lsRefs(r: Repo, lines: string[]): Buffer {
   return Buffer.concat(parts);
 }
 
+const packCacheOf = new WeakMap<object, Map<string, Buffer>>();
+
 /** Everything reachable from `wants`, minus `haves`, as one packfile. */
 function fetchReply(
   r: Repo,
@@ -476,11 +478,24 @@ function fetchReply(
     }
   }
 
-  const reachable = depth > 0
-    ? reachableObjectsShallow(r, known, cutParents)
-    : reachableObjects(r, known);
-  const send = reachable.filter((o) => !haveSet.has(o.oid));
-  const pack = buildPack(send.map((o) => ({ oid: o.oid, type: o.type, data: o.data })));
+  // A clone repeats one request against one history: depth 1 from the branch tip, no haves. Building
+  // the pack walks the object graph and re-deflates every entry, so the result is memoized on
+  // everything that can change it -- the wanted oids and depth, what the client already has, and
+  // the object count, which advances on every write.
+  const packKey = `${depth}|${wants.join(',')}|${haveSet.size}|${r.objects.size}|${cutParents.size}`;
+  let packCache = packCacheOf.get(r);
+  if (!packCache) { packCache = new Map<string, Buffer>(); packCacheOf.set(r, packCache); }
+  let pack = packCache.get(packKey);
+  if (pack === undefined) {
+    const reachable = depth > 0
+      ? reachableObjectsShallow(r, known, cutParents)
+      : reachableObjects(r, known);
+    const send = reachable.filter((o) => !haveSet.has(o.oid));
+    pack = buildPack(send.map((o) => ({ oid: o.oid, type: o.type, data: o.data })));
+    // Bounded so a long-lived repository cannot pin every shape of pack it has ever served.
+    if (packCache.size >= 16) packCache.clear();
+    packCache.set(packKey, pack);
+  }
 
   if (v2) {
     // Each v2 section is terminated by a delim packet (0001) and the reply ends with one flush.
